@@ -269,37 +269,20 @@ def run_media_pipeline(
     return rep_uids, reactions, shares
 
 
-def _stub_reaction(uid: Any, media: Any) -> str:
-    """Stub for testing: returns a placeholder reaction."""
-    return "I think this is okay."
-
-
-if __name__ == "__main__":
-    # Quick test with synthetic data
-    n_agents = 50
-    dim = PERSONALITY_DIM
-    rng = np.random.default_rng(42)
-    uids = list(range(n_agents))
-    vectors = rng.standard_normal((n_agents, dim)).astype(np.float64)
-    rep_uids, reactions, shares = run_media_pipeline(
-        uids, vectors, media="some_video", reaction_fn=_stub_reaction, seed=123
-    )
-    print("Representatives:", len(rep_uids), rep_uids[:5], "...")
-    print("Reactions sample:", reactions[0] if reactions else None)
-    print("Shares:", shares[:3] if shares else [])
-
-    """
-    Implemented in network.py:
-
-    1. Config – PERSONALITY_DIM = 64 at the top (you can change it). Constants for k-means range, representative fraction, top-K similarity, and same-cluster bonus.
-
-    2. K-means with auto k – kmeans_auto_k(vectors) tries k from 2 to min(20, n//5) and chooses k by best silhouette score; returns labels, centroids, and k.
-
-    3. 10% representatives – select_representatives(uids, vectors, labels, centroids, fraction=0.1) allocates quota by cluster size and picks agents closest to each cluster centroid; returns their UIDs.
-
-    4. VADER → actions – get_like_value_from_reaction(text) uses VADER compound; reaction_to_action(text) returns (like_value, Action). Seven actions (dislike_share_comment … like_share_comment) with equal-width bins over compound in [-1, 1].
-
-    5. Similarity and sharing – cosine_similarity_matrix, combined_similarity_scores (cosine + same-cluster bonus), and pick_recipients(sharer_idx, uids, vectors, labels) which picks 1–3 recipients at random from the top-K similar users.
-
-    6. Main API – run_media_pipeline(uids, vectors, media, reaction_fn, n_clusters=None, fraction=0.1, seed=None) returns (representative_uids, reactions, shares) where reactions is (uid, text, like_value, action) and shares is (sharer_uid, [recipient_uids]).
-    """
+# --- Example / testing: use example_100_agents.py ---
+# def _stub_reaction(uid: Any, media: Any) -> str:
+#     """Stub for testing: returns a placeholder reaction."""
+#     return "I think this is okay."
+#
+# if __name__ == "__main__":
+#     n_agents = 50
+#     dim = PERSONALITY_DIM
+#     rng = np.random.default_rng(42)
+#     uids = list(range(n_agents))
+#     vectors = rng.standard_normal((n_agents, dim)).astype(np.float64)
+#     rep_uids, reactions, shares = run_media_pipeline(
+#         uids, vectors, media="some_video", reaction_fn=_stub_reaction, seed=123
+#     )
+#     print("Representatives:", len(rep_uids), rep_uids[:5], "...")
+#     print("Reactions sample:", reactions[0] if reactions else None)
+#     print("Shares:", shares[:3] if shares else [])
