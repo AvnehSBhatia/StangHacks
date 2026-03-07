@@ -203,7 +203,6 @@ def pick_recipients(
     chosen_indices = rng.sample(list(candidates), num_recipients)
     return [uids[i] for i in chosen_indices]
 
-
 def run_media_pipeline(
     uids: list,
     vectors: np.ndarray,

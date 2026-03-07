@@ -31,7 +31,6 @@ def shares_to_edges(shares: list[tuple[Any, list]]) -> list[tuple[Any, Any]]:
     """
     return [(sharer_uid, rec_uid) for sharer_uid, rec_list in shares for rec_uid in rec_list]
 
-
 def get_clustering_output(
     uids: list,
     vectors: np.ndarray,
