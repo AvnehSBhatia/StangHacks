@@ -124,7 +124,7 @@ def main() -> None:
     top_results = nearest_answers_topk(predicted_embedding, checkpoint, top_k=args.top_k)
     counts = Counter(r[1] for r in top_results)
     print(f"\nTop-{args.top_k} sentiment distribution:")
-    for label in ["strong_like", "like", "neutral", "disli`ke", "strong_dislike"]:
+    for label in ["strong_like", "like", "neutral", "dislike", "strong_dislike"]:
         c = counts.get(label, 0)
         if c > 0:
             print(f"  {SENTIMENT_DISPLAY.get(label, label)}: {c}")
