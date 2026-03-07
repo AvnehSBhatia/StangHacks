@@ -21,10 +21,15 @@ BATCH_SIZE = 16
 EPOCHS = 250
 LEARNING_RATE = 3e-4
 MIN_LEARNING_RATE = 1e-5
-VAL_RATIO = 0.1
+VAL_RATIO = 0.2  # larger val set = more reliable early stopping
 USE_CACHE = True
-MODEL_TYPE = "attention"
+PATIENCE = 100  # early stop quickly
+WEIGHT_DECAY = 0.1  # strong L2
+DROPOUT = 0.5  # very aggressive dropout for 1k examples
+INPUT_NOISE = 0.05  # stronger Gaussian noise on inputs
+MODEL_TYPE = "linear"  # "linear" = minimal, "mlp" | "attention"
 ATTENTION_HIDDEN_DIM = 512
+MLP_HIDDEN_DIM = 64  # minimal = less overfitting
 ATTENTION_NUM_HEADS = 8
 ATTENTION_NUM_LAYERS = 2
 ATTENTION_FF_MULTIPLIER = 4
@@ -54,32 +59,52 @@ class ReviewTensorDataset:
 class AttentionBlock(nn.Module):
     """Transformer-style block over the persona/question token pair."""
 
-    def __init__(self, hidden_dim: int, num_heads: int, ff_multiplier: int = 4):
+    def __init__(self, hidden_dim: int, num_heads: int, ff_multiplier: int = 4, dropout: float = 0.0):
         super().__init__()
         self.attn = nn.MultiheadAttention(
             embed_dim=hidden_dim,
             num_heads=num_heads,
+            dropout=dropout,
             batch_first=True,
         )
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
+        self.drop = nn.Dropout(dropout)
         self.ff = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim * ff_multiplier),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim * ff_multiplier, hidden_dim),
         )
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         attn_output, _ = self.attn(tokens, tokens, tokens, need_weights=False)
-        tokens = self.norm1(tokens + attn_output)
-        ff_output = self.ff(tokens)
-        return self.norm2(tokens + ff_output)
+        tokens = self.norm1(tokens + self.drop(attn_output))
+        return self.norm2(tokens + self.ff(tokens))
+
+
+class LinearAnswerPredictor(nn.Module):
+    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = embedding_dim  # for checkpoint compat
+        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        return self.net(x)
 
 
 class LegacyAnswerPredictor(nn.Module):
-    """Original MLP predictor kept for loading older checkpoints."""
+    """MLP predictor: concat(persona, question) -> hidden -> output. Generalizes well on small data."""
 
-    def __init__(self, embedding_dim: int, hidden_dim: int | None = None):
+    def __init__(self, embedding_dim: int, hidden_dim: int | None = None, dropout: float = 0.0):
         super().__init__()
         hidden_dim = hidden_dim or (embedding_dim * 2)
         self.embedding_dim = embedding_dim
@@ -88,8 +113,63 @@ class LegacyAnswerPredictor(nn.Module):
             nn.Linear(embedding_dim * 2, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, embedding_dim),
         )
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        return self.net(x)
+
+
+class LinearAnswerPredictor(nn.Module):
+    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = embedding_dim  # for checkpoint compat
+        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        return self.net(x)
+
+
+class LinearAnswerPredictor(nn.Module):
+    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = embedding_dim  # for checkpoint compat
+        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        return self.net(x)
+
+
+class LinearAnswerPredictor(nn.Module):
+    """Minimal linear predictor: concat -> output. Minimal capacity, can't overfit."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = embedding_dim  # for checkpoint compat
+        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
 
     def forward(
         self,
@@ -110,6 +190,7 @@ class AnswerPredictor(nn.Module):
         num_heads: int = ATTENTION_NUM_HEADS,
         num_layers: int = ATTENTION_NUM_LAYERS,
         ff_multiplier: int = ATTENTION_FF_MULTIPLIER,
+        dropout: float = DROPOUT,
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -117,6 +198,7 @@ class AnswerPredictor(nn.Module):
         self.num_heads = num_heads
         self.num_layers = num_layers
         self.ff_multiplier = ff_multiplier
+        self.dropout_rate = dropout
 
         self.input_projection = nn.Linear(embedding_dim, hidden_dim)
         self.token_type_embeddings = nn.Parameter(torch.randn(2, hidden_dim) * 0.02)
@@ -126,6 +208,7 @@ class AnswerPredictor(nn.Module):
                     hidden_dim=hidden_dim,
                     num_heads=num_heads,
                     ff_multiplier=ff_multiplier,
+                    dropout=dropout,
                 )
                 for _ in range(num_layers)
             ]
@@ -134,6 +217,7 @@ class AnswerPredictor(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, embedding_dim),
         )
 
@@ -155,9 +239,7 @@ class AnswerPredictor(nn.Module):
 
 
 def cosine_embedding_loss(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    pred_norm = F.normalize(predicted, dim=-1)
-    target_norm = F.normalize(target, dim=-1)
-    return 1.0 - (pred_norm * target_norm).sum(dim=-1).mean()
+    return 1.0 - F.cosine_similarity(predicted, target, dim=-1).mean()
 
 
 def load_flat_examples(dataset_path: str | Path) -> list[FlatReviewExample]:
@@ -269,12 +351,11 @@ def split_indices(n_items: int, val_ratio: float, seed: int = 42) -> tuple[list[
 
 
 def select_batch(tensor: torch.Tensor, indices: list[int]) -> torch.Tensor:
-    index_tensor = torch.tensor(indices, dtype=torch.long, device=tensor.device)
-    return tensor.index_select(0, index_tensor)
+    return tensor.index_select(0, torch.tensor(indices, dtype=torch.long, device=tensor.device))
 
 
 def evaluate(
-    model: AnswerPredictor,
+    model: nn.Module,
     dataset: ReviewTensorDataset,
     indices: list[int],
 ) -> float:
@@ -305,6 +386,7 @@ def save_checkpoint(
             "num_heads": getattr(model, "num_heads", None),
             "num_layers": getattr(model, "num_layers", None),
             "ff_multiplier": getattr(model, "ff_multiplier", None),
+            "dropout": getattr(model, "dropout_rate", 0.0),
             "dataset_path": str(dataset_path),
             "preprocessor_path": str(preprocessor_path),
             "val_loss": val_loss,
@@ -330,7 +412,10 @@ def load_checkpoint(
             num_heads=int(checkpoint.get("num_heads", ATTENTION_NUM_HEADS)),
             num_layers=int(checkpoint.get("num_layers", ATTENTION_NUM_LAYERS)),
             ff_multiplier=int(checkpoint.get("ff_multiplier", ATTENTION_FF_MULTIPLIER)),
+            dropout=float(checkpoint.get("dropout", DROPOUT)),
         ).to(device)
+    elif model_type == "linear":
+        model = LinearAnswerPredictor(embedding_dim=int(checkpoint["embedding_dim"])).to(device)
     else:
         model = LegacyAnswerPredictor(
             embedding_dim=int(checkpoint["embedding_dim"]),
@@ -394,7 +479,7 @@ def train_answer_predictor(
     use_cache: bool = USE_CACHE,
 ) -> AnswerPredictor:
     device = get_device()
-    print(f"Using device: {device}")
+    print(f"device: {device}")
 
     dataset = build_tensor_dataset(
         dataset_path=dataset_path,
@@ -402,17 +487,27 @@ def train_answer_predictor(
         device=device,
         use_cache=use_cache,
     )
-    print(f"Loaded {dataset.size()} question-answer training pairs from {dataset_path}")
+    print(f"loaded {dataset.size()} QA pairs from {dataset_path}")
 
     train_indices, val_indices = split_indices(dataset.size(), val_ratio=val_ratio)
-    model = AnswerPredictor(
-        embedding_dim=dataset.embedding_dim,
-        hidden_dim=ATTENTION_HIDDEN_DIM,
-        num_heads=ATTENTION_NUM_HEADS,
-        num_layers=ATTENTION_NUM_LAYERS,
-        ff_multiplier=ATTENTION_FF_MULTIPLIER,
-    ).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    if MODEL_TYPE == "linear":
+        model = LinearAnswerPredictor(embedding_dim=dataset.embedding_dim).to(device)
+    elif MODEL_TYPE == "mlp":
+        model = LegacyAnswerPredictor(
+            embedding_dim=dataset.embedding_dim,
+            hidden_dim=MLP_HIDDEN_DIM,
+            dropout=DROPOUT,
+        ).to(device)
+    else:
+        model = AnswerPredictor(
+            embedding_dim=dataset.embedding_dim,
+            hidden_dim=ATTENTION_HIDDEN_DIM,
+            num_heads=ATTENTION_NUM_HEADS,
+            num_layers=ATTENTION_NUM_LAYERS,
+            ff_multiplier=ATTENTION_FF_MULTIPLIER,
+            dropout=DROPOUT,
+        ).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=max(1, epochs),
@@ -420,6 +515,7 @@ def train_answer_predictor(
     )
 
     best_val_loss = float("inf")
+    no_improve = 0
     for epoch in range(epochs):
         model.train()
         shuffled = train_indices[:]
@@ -432,6 +528,9 @@ def train_answer_predictor(
             persona_batch = select_batch(dataset.persona_vectors, batch_indices)
             question_batch = select_batch(dataset.question_embeddings, batch_indices)
             answer_batch = select_batch(dataset.answer_embeddings, batch_indices)
+            if INPUT_NOISE > 0:
+                persona_batch = persona_batch + torch.randn_like(persona_batch, device=persona_batch.device) * INPUT_NOISE
+                question_batch = question_batch + torch.randn_like(question_batch, device=question_batch.device) * INPUT_NOISE
 
             optimizer.zero_grad()
             predictions = model(persona_batch, question_batch)
@@ -445,13 +544,9 @@ def train_answer_predictor(
         train_loss = total_loss / max(1, batch_count)
         val_loss = evaluate(model, dataset, val_indices)
         current_lr = scheduler.get_last_lr()[0]
-        print(
-            f"[answer-predictor] epoch={epoch + 1}/{epochs} "
-            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-            f"lr={current_lr:.6f}"
-        )
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            no_improve = 0
             save_checkpoint(
                 model=model,
                 dataset=dataset,
@@ -460,9 +555,15 @@ def train_answer_predictor(
                 val_loss=val_loss,
                 path=checkpoint_path,
             )
+        else:
+            no_improve += 1
+        print(f"epoch {epoch + 1}/{epochs} train={train_loss:.4f} val={val_loss:.4f} lr={current_lr:.6f}")
         scheduler.step()
+        if no_improve >= PATIENCE:
+            print(f"early stop (no improvement for {PATIENCE} epochs)")
+            break
 
-    print(f"Saved best checkpoint to {checkpoint_path}")
+    print(f"saved best checkpoint -> {checkpoint_path}")
     return model
 
 
