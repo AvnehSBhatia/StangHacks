@@ -1,20 +1,29 @@
-"""Train CompressionModel using data from personality_answers.json and niche_questions.json."""
+"""Train the minimal persona encoder."""
 
-import json
+from __future__ import annotations
+
 import random
+from pathlib import Path
 
-import numpy as np
 import torch
-from response_modify import vectorize_pair
+
 from compression_model import (
     CompressionModel,
-    SimilarityConsistencyLoss,
-    reconstruction_loss,
+    cosine_embedding_loss,
+    smoke_test_shapes,
 )
+from embedding_engine import EmbeddedDataset, EmbeddingEngine
+from generate_personas import DEFAULT_OUTPUT_PATH, ensure_dataset_exists
 
-PERSONALITY_PATH = "personality_answers.json"
-NICHE_PATH = "niche_questions.json"
-SAVE_PATH = "compression_model.pt"
+SAVE_PATH = "persona_encoder_checkpoint.pt"
+
+# Training config
+FULL_TRAIN_EPOCHS = 100
+BATCH_SIZE =16
+LEARNING_RATE = 1e-3
+DATASET_PATH = str(DEFAULT_OUTPUT_PATH)
+MIN_PROFILES = 1000  # 100 archetypes x 10 profiles each
+USE_CACHE = True
 
 
 def get_device() -> torch.device:
@@ -25,170 +34,191 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def load_data():
-    with open(PERSONALITY_PATH) as f:
-        personality = json.load(f)
-    with open(NICHE_PATH) as f:
-        niche = json.load(f)
-    return personality, niche
+def shuffle_indices(n_items: int) -> list[int]:
+    indices = list(range(n_items))
+    random.shuffle(indices)
+    return indices
 
 
-def build_user_profile(personality_entry: dict, niche_pool: list, rng: random.Random) -> tuple[list[str], list[str]]:
-    """
-    Build a 10-question / 10-answer profile for one user.
-    Q1-5: global personality questions with the user's answers.
-    Q6-10: randomly sampled niche questions with their answers.
-    """
-    global_questions = [
-        "What are your biggest motivations?",
-        "What are your biggest weaknesses? Strengths?",
-        "What activities do you do to handle stress or recharge?",
-        "Do you think or act first?",
-        "Do you work better alone or with a group?",
-    ]
-    ans = personality_entry["answers"]
-    global_answers = [
-        ans["q1_motivation"],
-        ans["q2_weakness_strength"],
-        ans["q3_stress_recharge"],
-        ans["q4_think_or_act"],
-        ans["q5_alone_or_group"],
-    ]
-
-    niche_sample = rng.sample(niche_pool, 5)
-    niche_questions = [qa["question"] for qa in niche_sample]
-    niche_answers = [qa["answer"] for qa in niche_sample]
-
-    questions = global_questions + niche_questions
-    answers = global_answers + niche_answers
-    return questions, answers
+def slice_batch(dataset: EmbeddedDataset, indices: list[int]) -> tuple[torch.Tensor, ...]:
+    index_tensor = torch.tensor(indices, dtype=torch.long, device=dataset.questions.device)
+    questions = dataset.questions.index_select(0, index_tensor)
+    answers = dataset.answers.index_select(0, index_tensor)
+    archetype_embeddings = dataset.archetype_embeddings.index_select(0, index_tensor)
+    return questions, answers, archetype_embeddings
 
 
-def build_pairs(personality: dict, niche: dict, n_pairs: int, seed: int = 42) -> list:
-    """
-    Build (questions_1, answers_1, questions_2, answers_2) pairs from the JSON data.
-    Each pair is two different users; Q1-5 are shared, Q6-10 differ per user.
-    """
-    rng = random.Random(seed)
-    responses = personality["responses"]
-    niche_pool = niche["qa_pairs"]
-    pairs = []
-
-    for _ in range(n_pairs):
-        u1, u2 = rng.sample(responses, 2)
-        q1, a1 = build_user_profile(u1, niche_pool, rng)
-        q2, a2 = build_user_profile(u2, niche_pool, rng)
-        pairs.append((q1, a1, q2, a2))
-
-    return pairs
-
-
-def collate_batch(pairs: list, device: torch.device) -> tuple:
-    """Vectorize a batch of pairs and return (Q1, A1, Q2, A2) tensors."""
-    Q1_list, A1_list, Q2_list, A2_list = [], [], [], []
-
-    for q1, a1, q2, a2 in pairs:
-        Q1, A1, Q2, A2 = vectorize_pair(q1, a1, q2, a2)
-        Q1_list.append(Q1)
-        A1_list.append(A1)
-        Q2_list.append(Q2)
-        A2_list.append(A2)
-
-    Q1 = torch.tensor(np.stack(Q1_list), dtype=torch.float32, device=device)
-    A1 = torch.tensor(np.stack(A1_list), dtype=torch.float32, device=device)
-    Q2 = torch.tensor(np.stack(Q2_list), dtype=torch.float32, device=device)
-    A2 = torch.tensor(np.stack(A2_list), dtype=torch.float32, device=device)
-
-    return Q1, A1, Q2, A2
-
-
-def save_checkpoint(model, loss_fn, epoch, loss, path=SAVE_PATH):
-    torch.save({
+def save_checkpoint(
+    model: CompressionModel,
+    epoch: int,
+    loss: float,
+    dataset_path: str | Path,
+    path: str | Path = SAVE_PATH,
+    optimizer: torch.optim.Optimizer | None = None,
+    scheduler: torch.optim.lr_scheduler._LRScheduler | None = None,
+) -> None:
+    checkpoint = {
         "epoch": epoch,
         "loss": loss,
+        "dataset_path": str(dataset_path),
         "model_state_dict": model.state_dict(),
-        "loss_fn_state_dict": loss_fn.state_dict(),
-    }, path)
+        "model_embedding_dim": model.n,
+        "model_latent_dim": model.latent_dim,
+    }
+    if optimizer is not None:
+        checkpoint["optimizer_state_dict"] = optimizer.state_dict()
+    if scheduler is not None:
+        checkpoint["scheduler_state_dict"] = scheduler.state_dict()
+    torch.save(checkpoint, path)
 
 
-def load_checkpoint(path=SAVE_PATH, device=None):
+def load_checkpoint(
+    path: str | Path = SAVE_PATH,
+    device: torch.device | None = None,
+) -> tuple[CompressionModel, dict]:
     device = device or get_device()
-    model = CompressionModel(n=384).to(device)
-    loss_fn = SimilarityConsistencyLoss().to(device)
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    model.load_state_dict(ckpt["model_state_dict"], strict=False)
-    loss_fn.load_state_dict(ckpt["loss_fn_state_dict"])
-    print(f"Loaded checkpoint from epoch {ckpt['epoch']} (loss={ckpt['loss']:.4f})")
-    return model, loss_fn
+    checkpoint = torch.load(path, map_location=device, weights_only=False)
+
+    model_embedding_dim = int(checkpoint.get("model_embedding_dim", 64))
+    model_latent_dim = int(checkpoint.get("model_latent_dim", model_embedding_dim))
+    model = CompressionModel(
+        n=model_embedding_dim,
+        latent_dim=model_latent_dim,
+    ).to(device)
+    try:
+        model.load_state_dict(checkpoint["model_state_dict"])
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"Checkpoint {path} does not match the minimal persona encoder. "
+            "Retrain with train.py to create a fresh persona-only checkpoint."
+        ) from exc
+    return model, checkpoint
+
+
+def train_model(
+    model: CompressionModel,
+    dataset: EmbeddedDataset,
+    dataset_path: str | Path,
+    lr: float,
+    epochs: int,
+    batch_size: int,
+) -> CompressionModel:
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, epochs))
+    best_loss = float("inf")
+
+    for epoch in range(epochs):
+        indices = shuffle_indices(dataset.size())
+        total_loss = 0.0
+        batch_count = 0
+
+        for start in range(0, len(indices), batch_size):
+            batch_indices = indices[start : start + batch_size]
+            questions, answers, archetype_embeddings = slice_batch(dataset, batch_indices)
+
+            optimizer.zero_grad()
+            persona_summary = model.encode_persona(questions, answers)
+            loss = cosine_embedding_loss(persona_summary, archetype_embeddings)
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            batch_count += 1
+
+        scheduler.step()
+        avg_loss = total_loss / max(1, batch_count)
+        msg = (
+            f"[train] epoch={epoch + 1}/{epochs} "
+            f"loss={avg_loss:.4f} "
+            f"lr={scheduler.get_last_lr()[0]:.6f}"
+        )
+        print(msg)
+
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            save_checkpoint(
+                model=model,
+                epoch=epoch + 1,
+                loss=avg_loss,
+                dataset_path=dataset_path,
+                optimizer=optimizer,
+                scheduler=scheduler,
+            )
+
+    return model
+
+
+def tiny_overfit_test(
+    model: CompressionModel,
+    dataset: EmbeddedDataset,
+    steps: int = 20,
+    lr: float = 1e-3,
+) -> float:
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    indices = list(range(min(8, dataset.size())))
+
+    final_loss = 0.0
+    for _ in range(steps):
+        questions, answers, archetype_embeddings = slice_batch(dataset, indices)
+        optimizer.zero_grad()
+        persona_summary = model.encode_persona(questions, answers)
+        loss = cosine_embedding_loss(persona_summary, archetype_embeddings)
+        loss.backward()
+        optimizer.step()
+        final_loss = loss.item()
+    return final_loss
 
 
 def train(
-    n_epochs: int = 100,
-    batch_size: int = 8,
+    full_train_epochs: int = FULL_TRAIN_EPOCHS,
+    batch_size: int = 16,
     lr: float = 1e-3,
-    n_pairs: int = 64,
-    device: str = None,
-    recon_weight: float = 0.5,
-):
+    device: str | torch.device | None = None,
+    dataset_path: str | Path = DEFAULT_OUTPUT_PATH,
+    min_profiles: int = 1200,
+    use_cache: bool = True,
+) -> CompressionModel:
     device = device or get_device()
     if isinstance(device, str):
         device = torch.device(device)
     print(f"Using device: {device}")
 
-    personality, niche = load_data()
-    print(f"Loaded {len(personality['responses'])} personality profiles, {niche['total']} niche Q/A pairs")
-
-    model = CompressionModel(n=384).to(device)
-    loss_fn = SimilarityConsistencyLoss().to(device)
-    opt = torch.optim.Adam(
-        list(model.parameters()) + list(loss_fn.parameters()), lr=lr
+    dataset_path = ensure_dataset_exists(dataset_path, min_profiles=min_profiles)
+    embedding_engine = EmbeddingEngine(dataset_path=dataset_path)
+    dataset = embedding_engine.embed_training_examples(
+        dataset_path=dataset_path,
+        device=device,
+        use_cache=use_cache,
     )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=n_epochs)
+    print(f"Loaded embedded dataset with {dataset.size()} persona examples from {dataset_path}")
 
-    pairs = build_pairs(personality, niche, n_pairs=n_pairs)
-    n_batches = (len(pairs) + batch_size - 1) // batch_size
+    embedding_dim = embedding_engine.embedding_dim
+    latent_dim = embedding_dim
+    smoke_test_shapes(embedding_dim=embedding_dim, latent_dim=latent_dim)
 
-    best_loss = float("inf")
+    model = CompressionModel(n=embedding_dim, latent_dim=latent_dim).to(device)
+    model = train_model(
+        model=model,
+        dataset=dataset,
+        dataset_path=dataset_path,
+        lr=lr,
+        epochs=full_train_epochs,
+        batch_size=batch_size,
+    )
 
-    for epoch in range(n_epochs):
-        total_loss = 0.0
-        for i in range(0, len(pairs), batch_size):
-            batch = pairs[i : i + batch_size]
-            Q1, A1, Q2, A2 = collate_batch(batch, device)
-
-            opt.zero_grad()
-            v1 = model(Q1, A1)
-            v2 = model(Q2, A2)
-            loss_sim = loss_fn(A1, A2, v1, v2)
-            loss_recon = reconstruction_loss(model, Q1, A1)
-            loss = loss_sim + recon_weight * loss_recon
-            loss.backward()
-            opt.step()
-
-            total_loss += loss.item()
-
-        scheduler.step()
-        avg_loss = total_loss / n_batches
-        w = torch.softmax(loss_fn.logits, dim=0)
-        print(f"Epoch {epoch + 1}/{n_epochs}  loss={avg_loss:.4f}  lr={scheduler.get_last_lr()[0]:.6f}  weights=[{w[0]:.3f}, {w[1]:.3f}]")
-
-        if avg_loss < best_loss:
-            best_loss = avg_loss
-            save_checkpoint(model, loss_fn, epoch + 1, avg_loss)
-
-    print(f"\nBest loss: {best_loss:.4f} — saved to {SAVE_PATH}")
-    return model, loss_fn
+    overfit_loss = tiny_overfit_test(model, dataset, steps=15, lr=lr)
+    print(f"[overfit-check] final_loss={overfit_loss:.4f}")
+    print(f"Saved best checkpoint to {SAVE_PATH}")
+    return model
 
 
 if __name__ == "__main__":
-    import argparse
-    p = argparse.ArgumentParser()
-    p.add_argument("--n_epochs", type=int, default=1000)
-    p.add_argument("--batch_size", type=int, default=64)
-    p.add_argument("--n_pairs", type=int, default=32)
-    p.add_argument("--quick", action="store_true", help="Quick test: 2 epochs, 8 pairs")
-    args = p.parse_args()
-    if args.quick:
-        train(n_epochs=2, batch_size=8, n_pairs=8)
-    else:
-        train(n_epochs=args.n_epochs, batch_size=args.batch_size, n_pairs=args.n_pairs)
+    train(
+        full_train_epochs=FULL_TRAIN_EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=LEARNING_RATE,
+        dataset_path=DATASET_PATH,
+        min_profiles=MIN_PROFILES,
+        use_cache=USE_CACHE,
+    )
