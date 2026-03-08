@@ -65,10 +65,7 @@ def build_preprocessor_artifacts(
     answers = embedded_dataset.answers
     persona_encoder.eval()
 
-    unique_archetypes: list[str] = []
-    for a in archetypes:
-        if a not in unique_archetypes:
-            unique_archetypes.append(a)
+    unique_archetypes = list(dict.fromkeys(archetypes))
 
     # Embed unique archetypes for cosine similarity
     arch_embs = embedding_engine.encode(unique_archetypes)

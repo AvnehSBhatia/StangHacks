@@ -19,7 +19,7 @@ SAVE_PATH = "persona_encoder_checkpoint.pt"
 
 # Training config
 FULL_TRAIN_EPOCHS = 100
-BATCH_SIZE =16
+BATCH_SIZE = 16
 LEARNING_RATE = 1e-3
 DATASET_PATH = str(DEFAULT_OUTPUT_PATH)
 MIN_PROFILES = 1000  # 100 archetypes x 10 profiles each
@@ -176,7 +176,7 @@ def train(
     lr: float = 1e-3,
     device: str | torch.device | None = None,
     dataset_path: str | Path = DEFAULT_OUTPUT_PATH,
-    min_profiles: int = 1200,
+    min_profiles: int = MIN_PROFILES,
     use_cache: bool = True,
 ) -> CompressionModel:
     device = device or get_device()

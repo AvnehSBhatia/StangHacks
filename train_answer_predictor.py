@@ -126,60 +126,6 @@ class LegacyAnswerPredictor(nn.Module):
         return self.net(x)
 
 
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
 class AnswerPredictor(nn.Module):
     """Attention-based predictor over persona and question tokens."""
 
@@ -468,6 +414,63 @@ def nearest_answer_text(predicted_embedding: torch.Tensor, checkpoint: dict) -> 
     )
 
 
+def predict_answer_embeddings_batch(
+    persona_vectors: torch.Tensor,
+    question_embedding: torch.Tensor,
+    model: nn.Module,
+) -> torch.Tensor:
+    """
+    Batch predict answer embeddings. persona_vectors (N, dim), question_embedding (1, dim) or (dim,).
+    Returns (N, dim).
+    """
+    if question_embedding.dim() == 1:
+        question_embedding = question_embedding.unsqueeze(0)
+    n = persona_vectors.size(0)
+    q = question_embedding.expand(n, -1)
+    with torch.no_grad():
+        return model(persona_vectors, q)
+
+
+def batch_nearest_answer_texts(
+    predicted_embeddings: torch.Tensor,
+    checkpoint: dict,
+    temperature: float | None = None,
+    top_k: int = 25,
+    rng: random.Random | None = None,
+) -> list[tuple[str, str, float]]:
+    """
+    Batch version of nearest_answer_text. Returns list of (answer_text, sentiment_label, score).
+
+    If temperature is None: strict nearest (argmax) — can skew toward one sentiment if bank is imbalanced.
+    If temperature > 0: sample from top_k nearest with softmax(scores/temperature) for more diversity.
+    """
+    answer_bank = checkpoint["answer_embeddings"].to(predicted_embeddings.device)
+    pred_norm = F.normalize(predicted_embeddings, dim=-1)
+    bank_norm = F.normalize(answer_bank, dim=-1)
+    scores = pred_norm @ bank_norm.T  # (N, bank_size)
+    rng = rng or random.Random()
+
+    out: list[tuple[str, str, float]] = []
+    for j in range(scores.size(0)):
+        row = scores[j]
+        k = min(top_k, row.size(0))
+        top_scores, top_idx = row.topk(k, dim=0)
+        if temperature is not None and temperature > 0 and k > 0:
+            probs = F.softmax(top_scores.float() / temperature, dim=0).cpu().numpy()
+            chosen = rng.choices(range(k), weights=probs, k=1)[0]
+            i = int(top_idx[chosen].item())
+        else:
+            i = int(top_idx[0].item())
+        out.append(
+            (
+                checkpoint["answer_texts"][i],
+                checkpoint["sentiment_labels"][i],
+                float(scores[j, i].item()),
+            )
+        )
+    return out
+
+
 def train_answer_predictor(
     dataset_path: str | Path = DATASET_PATH,
     preprocessor_path: str | Path = PREPROCESSOR_CHECKPOINT,
@@ -477,7 +480,7 @@ def train_answer_predictor(
     lr: float = LEARNING_RATE,
     val_ratio: float = VAL_RATIO,
     use_cache: bool = USE_CACHE,
-) -> AnswerPredictor:
+) -> nn.Module:
     device = get_device()
     print(f"device: {device}")
 

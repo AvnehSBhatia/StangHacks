@@ -3,14 +3,64 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
+
+# Reduce Hugging Face / transformers load report before any HF import
+os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+
+# Load .env from project root (directory of this file) so HF_TOKEN is set before any HF import
+def _load_env_from_project_root() -> None:
+    _root = Path(__file__).resolve().parent
+    _env_file = _root / ".env"
+    if not _env_file.exists():
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(_env_file)
+        if os.environ.get("HF_TOKEN") and "HUGGING_FACE_HUB_TOKEN" not in os.environ:
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = os.environ["HF_TOKEN"]
+        return
+    except ImportError:
+        pass
+    # Fallback without python-dotenv: parse KEY=VALUE lines and set os.environ
+    with open(_env_file, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key, value = key.strip(), value.strip()
+            if value.startswith(('"', "'")) and value[0] == value[-1]:
+                value = value[1:-1]
+            if key:
+                if key not in os.environ:
+                    os.environ[key] = value
+                # So HF Hub sees the token (it checks HUGGING_FACE_HUB_TOKEN)
+                if key == "HF_TOKEN" and "HUGGING_FACE_HUB_TOKEN" not in os.environ:
+                    os.environ["HUGGING_FACE_HUB_TOKEN"] = value
+
+
+_load_env_from_project_root()
 
 import numpy as np
 import torch
 from sentence_transformers import SentenceTransformer
 
+# Suppress "UNEXPECTED" / "Loading weights" warnings when loading the sentence-transformers model
+for _name in ("transformers", "transformers.modeling_utils", "sentence_transformers"):
+    logging.getLogger(_name).setLevel(logging.ERROR)
+
 DEFAULT_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+def _get_hf_token(token: str | None = None) -> str | None:
+    """Hugging Face token: argument > HF_TOKEN > HUGGING_FACE_HUB_TOKEN env."""
+    if token is not None and token.strip():
+        return token.strip()
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or None
 
 
 @dataclass
@@ -39,9 +89,17 @@ class EmbeddingEngine:
         self,
         model_name: str = DEFAULT_MODEL_NAME,
         dataset_path: str | Path | None = None,
+        token: str | None = None,
     ):
         self.model_name = model_name
-        self.model = SentenceTransformer(model_name)
+        hf_token = _get_hf_token(token)
+        # Suppress verbose load report during model load
+        _prev = logging.getLogger("transformers").level
+        logging.getLogger("transformers").setLevel(logging.ERROR)
+        try:
+            self.model = SentenceTransformer(model_name, token=hf_token)
+        finally:
+            logging.getLogger("transformers").setLevel(_prev)
         self.embedding_dim = int(self.model.get_sentence_embedding_dimension())
         self.dataset_path = Path(dataset_path) if dataset_path is not None else None
 

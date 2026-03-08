@@ -12,8 +12,8 @@ from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Editable: personality vector dimension (e.g. 64 from CompressionModel or 384 from sentence embeddings)
-PERSONALITY_DIM = 64
+# Personality vector dimension: 384 from sentence embeddings + preprocessor (matches embedding_engine + preprocessor.py)
+PERSONALITY_DIM = 384
 
 # K-means auto-k range
 K_MIN = 2
@@ -59,10 +59,16 @@ def _like_value_to_action(compound: float) -> Action:
     return list(Action)[NUM_ACTIONS - 1]
 
 
+def like_value_to_action(like_value: float) -> Action:
+    """Map like value (VADER compound in [-1, 1]) to one of 7 actions. Public API."""
+    return _like_value_to_action(like_value)
+
+
 def kmeans_auto_k(vectors: np.ndarray, k_range: tuple[int, int] | None = None) -> tuple[np.ndarray, np.ndarray, int]:
     """
-    Run k-means with automatic k selection via silhouette score.
-    vectors: (n, dim)
+    Run k-means on the full-dimensional vectors (all dims, not reduced).
+    Automatic k selection via silhouette score.
+    vectors: (n, dim) e.g. (n, 384) personality vectors.
     Returns: (labels shape (n,), centroids (k, dim), k).
     """
     n, _ = vectors.shape
@@ -188,20 +194,28 @@ def pick_recipients(
     labels: np.ndarray,
     top_k: int = TOP_K_SIMILAR,
     rng: random.Random | None = None,
+    exclude_uids: set | None = None,
 ) -> list:
     """
     For the sharer at index sharer_idx, pick 1–3 recipients from top-K similar users.
+    exclude_uids: UIDs that cannot be chosen (e.g. agents who already shared this media
+                  to this sharer — prevents bidirectional sharing of the same media).
     Returns list of recipient UIDs.
     """
     rng = rng or random.Random()
     n = len(uids)
     if n <= 1:
         return []
+    exclude_uids = exclude_uids or set()
     scores = combined_similarity_scores(sharer_idx, vectors, labels)
     candidates = np.argsort(-scores)[:top_k]
-    num_recipients = rng.randint(1, min(3, len(candidates)))
-    chosen_indices = rng.sample(list(candidates), num_recipients)
-    return [uids[i] for i in chosen_indices]
+    # Exclude anyone who already shared this media to the current sharer (no bidirectional)
+    candidate_uids = [uids[i] for i in candidates if uids[i] not in exclude_uids]
+    if not candidate_uids:
+        return []
+    num_recipients = rng.randint(1, min(3, len(candidate_uids)))
+    chosen_uids = rng.sample(candidate_uids, num_recipients)
+    return chosen_uids
 
 def run_media_pipeline(
     uids: list,
@@ -254,14 +268,23 @@ def run_media_pipeline(
         like, action = reaction_to_action(text)
         reactions.append((uid, text, like, action))
 
-    # 4. For each representative who shared, pick 1–3 recipients by similarity
-    shares = []
+    # 4. For each representative who shared, pick 1–3 recipients by similarity.
+    #    No bidirectional sharing of this media: if X already shared to Y, Y cannot share to X.
+    shares: list[tuple[Any, list]] = []
     for uid in rep_uids:
         like, action = next((r[2], r[3]) for r in reactions if r[0] == uid)
         if not _action_includes_share(action):
             continue
+        # UIDs that already shared this media to uid — exclude them as recipients
+        already_shared_to_me = {
+            sharer_uid
+            for sharer_uid, rec_list in shares
+            if uid in rec_list
+        }
         idx = uid_to_idx[uid]
-        recipients = pick_recipients(idx, uids, vectors, labels, rng=rng)
+        recipients = pick_recipients(
+            idx, uids, vectors, labels, rng=rng, exclude_uids=already_shared_to_me
+        )
         if recipients:
             shares.append((uid, recipients))
 

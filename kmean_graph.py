@@ -1,6 +1,6 @@
 """
-K-means clustering data: 2D coordinates (PCA of personality vectors) and
-share edges. Outputs only numbers and arrays; no graph/plotting.
+K-means clustering uses full-dimensional personality vectors (all dims).
+2D coordinates here are for visualization only (PCA); clustering is never done in 2D.
 """
 
 from typing import Any
@@ -13,7 +13,8 @@ from network import kmeans_auto_k
 
 def get_2d_coordinates(vectors: np.ndarray, random_state: int = 42) -> np.ndarray:
     """
-    Reduce (n, dim) vectors to (n, 2) using PCA.
+    For visualization only: reduce (n, dim) to (n, 2) via PCA.
+    Clustering is always done in full dimension; this does not affect k-means.
     Returns: (n, 2) array of coordinates; row i corresponds to agent i.
     """
     vectors = np.asarray(vectors, dtype=np.float64)
@@ -39,17 +40,20 @@ def get_clustering_output(
     pca_random_state: int = 42,
 ) -> tuple[np.ndarray, list[tuple[Any, Any]]]:
     """
-    Compute 2D coordinates and share edges only (no graph).
+    Compute 2D coordinates (for plotting) and share edges. K-means uses all dimensions.
+
+    Clustering (if labels is None) is run on full vectors, not on 2D.
+    2D is only for visualization.
 
     Args:
         uids: List of n agent UIDs (same order as vectors).
-        vectors: (n, dim) personality vectors.
-        labels: (n,) cluster label per agent. If None, k-means is run to get labels.
+        vectors: (n, dim) full-dimensional personality vectors; k-means uses all dims.
+        labels: (n,) cluster label per agent. If None, k-means is run on vectors (all dims).
         shares: List of (sharer_uid, [recipient_uid, ...]) from run_media_pipeline. Optional.
-        pca_random_state: Seed for PCA.
+        pca_random_state: Seed for PCA (used only for 2D coords, not for clustering).
 
     Returns:
-        coords: (n, 2) array; coords[i] is the 2D position for uids[i].
+        coords: (n, 2) array for visualization; coords[i] is the 2D position for uids[i].
         edges: List of (start_uid, end_uid) for each share.
     """
     vectors = np.asarray(vectors, dtype=np.float64)
@@ -58,8 +62,8 @@ def get_clustering_output(
         raise ValueError("len(uids) must equal vectors.shape[0]")
 
     if labels is None:
-        labels, _, _ = kmeans_auto_k(vectors)
+        labels, _, _ = kmeans_auto_k(vectors)  # full-dimensional clustering
 
-    coords = get_2d_coordinates(vectors, random_state=pca_random_state)
+    coords = get_2d_coordinates(vectors, random_state=pca_random_state)  # 2D only for plotting
     edges = shares_to_edges(shares) if shares else []
     return coords, edges

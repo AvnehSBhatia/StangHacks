@@ -1,1 +1,7 @@
+# Byte-compiled / cache
 **/__pycache__/
+
+# Local env and secrets (do not commit)
+.env
+.env.*
+!.env.example
