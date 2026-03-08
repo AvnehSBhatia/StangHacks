@@ -16,7 +16,7 @@ PREPROCESSOR_CHECKPOINT = "preprocessor_checkpoint.pt"
 class PreprocessorModel(nn.Module):
     """
     Takes a 384D description embedding, computes cosine similarity with 100 archetype
-    embeddings -> 100-dim vector, double softmax with temperature 0.55, then weighted
+    embeddings -> 100-dim vector, tanh with temperature for weights, then weighted
     sum of archetype personas -> 384D output.
     """
 
@@ -44,8 +44,8 @@ class PreprocessorModel(nn.Module):
         """
         desc_norm = F.normalize(description_embedding, dim=-1)
         sims = desc_norm @ self.archetype_embeddings.T  # (B, 100)
-        weights = F.softmax(sims / self.temperature, dim=-1)
-        weights = F.softmax(weights / self.temperature, dim=-1)  # double softmax
+        weights = (torch.tanh(sims / self.temperature) + 1) / 2  # [0, 1]
+        weights = weights / weights.sum(dim=-1, keepdim=True)  # normalize to sum to 1
         return weights @ self.archetype_personas  # (B, 384)
 
 
