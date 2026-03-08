@@ -24,15 +24,16 @@ MIN_LEARNING_RATE = 1e-5
 VAL_RATIO = 0.2  # larger val set = more reliable early stopping
 USE_CACHE = True
 PATIENCE = 100  # early stop quickly
-WEIGHT_DECAY = 0.1  # strong L2
-DROPOUT = 0.5  # very aggressive dropout for 1k examples
-INPUT_NOISE = 0.05  # stronger Gaussian noise on inputs
-MODEL_TYPE = "linear"  # "linear" = minimal, "mlp" | "attention"
+WEIGHT_DECAY = 0.01  # moderate L2 (0.1 was over-regularizing)
+DROPOUT = 0.3  # moderate dropout for MLP
+INPUT_NOISE = 0.03  # light Gaussian noise on inputs
+MODEL_TYPE = "resnet"  # "linear" | "mlp" | "resnet" | "attention"
+GRAD_CLIP = 1.0  # gradient clipping for stability
 ATTENTION_HIDDEN_DIM = 512
-MLP_HIDDEN_DIM = 64  # minimal = less overfitting
 ATTENTION_NUM_HEADS = 8
 ATTENTION_NUM_LAYERS = 2
 ATTENTION_FF_MULTIPLIER = 4
+MLP_HIDDEN_DIM = 128  # more capacity for better learning
 
 
 @dataclass
@@ -83,100 +84,106 @@ class AttentionBlock(nn.Module):
         return self.norm2(tokens + self.ff(tokens))
 
 
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
 class LegacyAnswerPredictor(nn.Module):
     """MLP predictor: concat(persona, question) -> hidden -> output. Generalizes well on small data."""
 
-    def __init__(self, embedding_dim: int, hidden_dim: int | None = None, dropout: float = 0.0):
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int | None = None,
+        dropout: float = 0.0,
+        num_layers: int = 2,
+    ):
         super().__init__()
         hidden_dim = hidden_dim or (embedding_dim * 2)
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
+        layers: list[nn.Module] = []
+        in_dim = embedding_dim * 2
+        for i in range(num_layers - 1):
+            layers.extend([
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+                nn.LayerNorm(hidden_dim),
+                nn.Dropout(dropout),
+            ])
+            in_dim = hidden_dim
+        layers.append(nn.Linear(in_dim, embedding_dim))
+        self.net = nn.Sequential(*layers)
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        return self.net(x)
+
+
+class LinearAnswerPredictor(nn.Module):
+    """Minimal linear predictor: concat(persona, question) -> output."""
+
+    def __init__(self, embedding_dim: int):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = embedding_dim  # for checkpoint compat
+        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        return self.net(x)
+
+
+class ResNetAnswerPredictor(nn.Module):
+    """ResNet-style MLP: residual blocks with skip connections for better gradient flow."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int = MLP_HIDDEN_DIM,
+        num_blocks: int = 2,
+        dropout: float = DROPOUT,
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.hidden_dim = hidden_dim
+        self.num_blocks = num_blocks
+        self.dropout_rate = dropout
+        self.input_proj = nn.Linear(embedding_dim * 2, hidden_dim)
+        self.blocks = nn.ModuleList([
+            ResNetBlock(hidden_dim, dropout) for _ in range(num_blocks)
+        ])
+        self.output_proj = nn.Linear(hidden_dim, embedding_dim)
+
+    def forward(
+        self,
+        persona_vectors: torch.Tensor,
+        question_embeddings: torch.Tensor,
+    ) -> torch.Tensor:
+        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+        x = self.input_proj(x)
+        for block in self.blocks:
+            x = block(x) + x  # residual
+        return self.output_proj(x)
+
+
+class ResNetBlock(nn.Module):
+    """Single residual block: Linear -> ReLU -> LayerNorm -> Dropout."""
+
+    def __init__(self, hidden_dim: int, dropout: float = 0.0):
+        super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(embedding_dim * 2, hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.LayerNorm(hidden_dim),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, embedding_dim),
         )
 
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat(persona, question) -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
-        return self.net(x)
-
-
-class LinearAnswerPredictor(nn.Module):
-    """Minimal linear predictor: concat -> output. Minimal capacity, can't overfit."""
-
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.embedding_dim = embedding_dim
-        self.hidden_dim = embedding_dim  # for checkpoint compat
-        self.net = nn.Linear(embedding_dim * 2, embedding_dim)
-
-    def forward(
-        self,
-        persona_vectors: torch.Tensor,
-        question_embeddings: torch.Tensor,
-    ) -> torch.Tensor:
-        x = torch.cat([persona_vectors, question_embeddings], dim=-1)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.net(x)
 
 
@@ -385,8 +392,9 @@ def save_checkpoint(
             "model_type": MODEL_TYPE,
             "num_heads": getattr(model, "num_heads", None),
             "num_layers": getattr(model, "num_layers", None),
+            "num_blocks": getattr(model, "num_blocks", None),
             "ff_multiplier": getattr(model, "ff_multiplier", None),
-            "dropout": getattr(model, "dropout_rate", 0.0),
+            "dropout": getattr(model, "dropout_rate", DROPOUT),
             "dataset_path": str(dataset_path),
             "preprocessor_path": str(preprocessor_path),
             "val_loss": val_loss,
@@ -416,6 +424,13 @@ def load_checkpoint(
         ).to(device)
     elif model_type == "linear":
         model = LinearAnswerPredictor(embedding_dim=int(checkpoint["embedding_dim"])).to(device)
+    elif model_type == "resnet":
+        model = ResNetAnswerPredictor(
+            embedding_dim=int(checkpoint["embedding_dim"]),
+            hidden_dim=int(checkpoint["hidden_dim"]),
+            num_blocks=int(checkpoint.get("num_blocks", 2)),
+            dropout=float(checkpoint.get("dropout", DROPOUT)),
+        ).to(device)
     else:
         model = LegacyAnswerPredictor(
             embedding_dim=int(checkpoint["embedding_dim"]),
@@ -498,6 +513,13 @@ def train_answer_predictor(
             hidden_dim=MLP_HIDDEN_DIM,
             dropout=DROPOUT,
         ).to(device)
+    elif MODEL_TYPE == "resnet":
+        model = ResNetAnswerPredictor(
+            embedding_dim=dataset.embedding_dim,
+            hidden_dim=MLP_HIDDEN_DIM,
+            num_blocks=2,
+            dropout=DROPOUT,
+        ).to(device)
     else:
         model = AnswerPredictor(
             embedding_dim=dataset.embedding_dim,
@@ -508,10 +530,12 @@ def train_answer_predictor(
             dropout=DROPOUT,
         ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
-        T_max=max(1, epochs),
-        eta_min=MIN_LEARNING_RATE,
+        mode="min",
+        factor=0.5,
+        patience=15,
+        min_lr=MIN_LEARNING_RATE,
     )
 
     best_val_loss = float("inf")
@@ -536,6 +560,8 @@ def train_answer_predictor(
             predictions = model(persona_batch, question_batch)
             loss = cosine_embedding_loss(predictions, answer_batch)
             loss.backward()
+            if GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
 
             total_loss += float(loss.item())
@@ -558,7 +584,7 @@ def train_answer_predictor(
         else:
             no_improve += 1
         print(f"epoch {epoch + 1}/{epochs} train={train_loss:.4f} val={val_loss:.4f} lr={current_lr:.6f}")
-        scheduler.step()
+        scheduler.step(val_loss)
         if no_improve >= PATIENCE:
             print(f"early stop (no improvement for {PATIENCE} epochs)")
             break

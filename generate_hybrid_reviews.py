@@ -73,6 +73,33 @@ def vader_label(compound: float) -> str:
     return "neutral"
 
 
+# Selfish/negative "hater" archetypes - VERY different from each other
+HATER_PRIMARY_ROLES = [
+    "troll who enjoys provoking and does not care about substance",
+    "cynic who assumes everything is a scam and trusts nothing",
+    "gatekeeper who excludes and dismisses as not real or legitimate",
+    "envious critic who tears down what they secretly covet",
+    "nitpicker who obsesses over tiny flaws and misses the whole point",
+    "armchair expert who condescends and knows better than everyone",
+    "grudge holder who brings unrelated baggage and cannot evaluate fairly",
+    "dismissive skeptic who has seen it all and nothing impresses",
+    "contrarian who disagrees for sport regardless of merit",
+    "self-absorbed reviewer who only cares how it affects them personally",
+]
+HATER_SECONDARY_ROLES = [
+    "fault-finder who looks for problems first and celebrates finding them",
+    "tear-down enthusiast who enjoys criticizing more than understanding",
+    "never-satisfied perfectionist with impossible standards",
+    "superiority-complex type who talks down to everyone",
+    "whataboutist who deflects with tangents and false equivalences",
+    "straw-man builder who misrepresents ideas to attack them",
+    "ad-hominem leaner who attacks the creator instead of the work",
+    "goalpost mover who changes criteria mid-review to keep disliking",
+    "sealion who bad-faith just-asking-questions to exhaust others",
+    "bad-faith reader who assumes the worst interpretation always",
+]
+
+
 def build_hybrid_profiles(n: int, seed: int) -> list[HybridProfile]:
     rng = random.Random(seed)
     primary_roles = [
@@ -105,7 +132,8 @@ def build_hybrid_profiles(n: int, seed: int) -> list[HybridProfile]:
         "experimental": "high",
     }
 
-    combos = list(
+    # Professional profiles (50)
+    pro_combos = list(
         product(
             primary_roles,
             secondary_roles,
@@ -120,6 +148,29 @@ def build_hybrid_profiles(n: int, seed: int) -> list[HybridProfile]:
             VALUES,
         )
     )
+    rng.shuffle(pro_combos)
+
+    # Hater profiles (50) - selfish/negative, VERY different from each other
+    hater_combos = list(
+        product(
+            HATER_PRIMARY_ROLES,
+            HATER_SECONDARY_ROLES,
+            ITEM_TYPES,
+            AUDIENCES,
+            TONES,
+            NOVELTY_LEVELS,
+            EVIDENCE_LEVELS,
+            CTA_STYLES,
+            PACE_LEVELS,
+            VISUAL_STYLES,
+            VALUES,
+        )
+    )
+    rng.shuffle(hater_combos)
+
+    # 50 professional + 50 hater, interleaved
+    n_pro, n_hater = n // 2, n - n // 2
+    combos = list(pro_combos[:n_pro]) + list(hater_combos[:n_hater])
     rng.shuffle(combos)
 
     profiles: list[HybridProfile] = []
@@ -138,14 +189,25 @@ def build_hybrid_profiles(n: int, seed: int) -> list[HybridProfile]:
             visual_style,
             value,
         ) = combo
-        name = f"{primary_role} / {secondary_role} #{idx + 1}"
-        description = (
-            f"A hybrid reviewer who thinks like a {primary_role} and a {secondary_role}. "
-            f"They are most interested in {item_type}s aimed at {audience}. "
-            f"They prefer a {tone} tone, {novelty} ideas, {evidence} evidence, and a {cta_style} call to action. "
-            f"They respond best to a {pace} pacing style, a {visual_style} presentation, and work that prioritizes {value}. "
-            f"They have {risk_map[novelty]} tolerance for creative risk."
-        )
+        is_hater = primary_role in HATER_PRIMARY_ROLES
+        name = f"{primary_role[:30]} / {secondary_role[:30]} #{idx + 1}"
+        if is_hater:
+            description = (
+                f"A negative, selfish reviewer who is a {primary_role} and a {secondary_role}. "
+                f"They tend to tear down work, find faults, and rarely engage constructively. "
+                f"They are most interested in {item_type}s aimed at {audience}. "
+                f"They prefer a {tone} tone, {novelty} ideas, {evidence} evidence, and a {cta_style} call to action. "
+                f"They respond best to a {pace} pacing style, a {visual_style} presentation, and work that prioritizes {value}. "
+                f"They have {risk_map[novelty]} tolerance for creative risk."
+            )
+        else:
+            description = (
+                f"A hybrid reviewer who thinks like a {primary_role} and a {secondary_role}. "
+                f"They are most interested in {item_type}s aimed at {audience}. "
+                f"They prefer a {tone} tone, {novelty} ideas, {evidence} evidence, and a {cta_style} call to action. "
+                f"They respond best to a {pace} pacing style, a {visual_style} presentation, and work that prioritizes {value}. "
+                f"They have {risk_map[novelty]} tolerance for creative risk."
+            )
         if description in used_descriptions:
             continue
         used_descriptions.add(description)
