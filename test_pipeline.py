@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import Counter
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
-from preprocessor import PREPROCESSOR_CHECKPOINT
+from embedding_engine import EmbeddingEngine
+from preprocessor import PREPROCESSOR_CHECKPOINT, load_preprocessor
 from train import get_device
 from train_answer_predictor import (
     CHECKPOINT_PATH,
@@ -67,6 +70,121 @@ def load_profile(dataset_path: Path, profile_id: int) -> dict:
     return responses[profile_id]
 
 
+def run_benchmark(
+    n: int,
+    dataset_path: Path,
+    checkpoint_path: Path,
+    preprocessor_path: Path,
+    batch_size: int = 128,
+    top_k: int = 5,
+) -> None:
+    """Load all models into RAM, run n inferences (encode + preprocessor + model) in multibatch, report speed."""
+    device = get_device()
+    print(f"Loading all models into RAM (device={device})...")
+
+    # CuDNN benchmark finds faster algorithms (CUDA only)
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    engine = EmbeddingEngine()
+    engine.model.to(device)
+    # Half precision: ~2x faster encoder, less memory (encoder is the bottleneck)
+    if device.type in ("cuda", "mps"):
+        engine.model.half()
+    preprocessor = load_preprocessor(preprocessor_path, device=device)
+    preprocessor.eval()
+    model, checkpoint = load_checkpoint(checkpoint_path, device=device)
+    model.eval()
+    answer_bank = checkpoint["answer_embeddings"].to(device)
+    answer_bank_norm = F.normalize(answer_bank, dim=-1)
+
+    # Compile for faster inference (PyTorch 2.0+)
+    if hasattr(torch, "compile"):
+        preprocessor = torch.compile(preprocessor, mode="reduce-overhead")
+        model = torch.compile(model, mode="reduce-overhead")
+
+    with dataset_path.open() as f:
+        data = json.load(f)
+    responses = data["responses"]
+
+    pairs: list[tuple[str, str]] = []
+    for i in range(n):
+        profile = responses[i % len(responses)]
+        qa = profile["qa_pairs"][i % len(profile["qa_pairs"])]
+        pairs.append((profile["description"], qa["question"]))
+
+    descriptions = [p[0] for p in pairs]
+    questions = [p[1] for p in pairs]
+
+    # Use convert_to_tensor to keep on device, avoid numpy round-trip
+    encode_batch = min(batch_size, n)
+
+    print(f"Running {n} full pipelines (encode + preprocessor + model + nearest), batch={encode_batch}...")
+    start = time.perf_counter()
+    with torch.inference_mode():
+        desc_embs = engine.model.encode(
+            descriptions,
+            batch_size=encode_batch,
+            convert_to_tensor=True,
+            show_progress_bar=False,
+        )
+        desc_embs = desc_embs.float().to(device)
+        q_embs = engine.model.encode(
+            questions,
+            batch_size=encode_batch,
+            convert_to_tensor=True,
+            show_progress_bar=False,
+        )
+        q_embs = q_embs.float().to(device)
+        personas = preprocessor(desc_embs)
+        preds = model(personas, q_embs)
+        if isinstance(preds, tuple):
+            preds = preds[0]
+        pred_norm = F.normalize(preds, dim=-1)
+        sims = pred_norm @ answer_bank_norm.T
+        best_indices = sims.argmax(dim=-1)
+    elapsed = time.perf_counter() - start
+
+    print("\n" + "=" * 60)
+    print("BENCHMARK RESULTS (encoding + inference)")
+    print("=" * 60)
+    print(f"  Runs: {n}")
+    print(f"  Total time: {elapsed:.3f}s")
+    print(f"  Per run: {elapsed / n * 1000:.2f} ms")
+    print(f"  Throughput: {n / elapsed:.1f} runs/s")
+
+    # Sentiment distribution from top-k answers per run (majority vote)
+    k = min(top_k, sims.size(-1))
+    topk_indices = sims.topk(k, dim=-1).indices  # (n, k)
+    sentiment_labels = checkpoint["sentiment_labels"]
+
+    run_sentiments: list[str] = []
+    for i in range(n):
+        labels = [sentiment_labels[idx] for idx in topk_indices[i].cpu().tolist()]
+        vote = Counter(labels).most_common(1)[0][0]
+        run_sentiments.append(vote)
+
+    counts = Counter(run_sentiments)
+    order = ["strong_like", "like", "neutral", "dislike", "strong_dislike"]
+    labels_display = [SENTIMENT_DISPLAY.get(l, l) for l in order]
+    values = [counts.get(l, 0) for l in order]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    colors = ["#2ecc71", "#3498db", "#95a5a6", "#e74c3c", "#c0392b"]
+    bars = ax.bar(labels_display, values, color=colors)
+    ax.set_xlabel("Sentiment")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Sentiment distribution across {n} runs (top-{k} majority vote)")
+    for bar, v in zip(bars, values):
+        if v > 0:
+            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5, str(v), ha="center", fontsize=10)
+    plt.tight_layout()
+    out_path = Path("benchmark_sentiments.png")
+    plt.savefig(out_path, dpi=150)
+    print(f"\nSaved sentiment graph to {out_path}")
+    plt.show()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Full pipeline: description + question -> sentiment")
     parser.add_argument("--dataset", type=Path, default=DATASET_PATH)
@@ -76,7 +194,19 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, default=CHECKPOINT_PATH)
     parser.add_argument("--preprocessor", type=Path, default=PREPROCESSOR_CHECKPOINT)
     parser.add_argument("--top-k", type=int, default=5, help="Show top-k for sentiment distribution")
+    parser.add_argument("--benchmark", action="store_true", help="Run 100 batched inferences, models loaded once")
+    parser.add_argument("--n", type=int, default=100, help="Number of runs for benchmark")
     args = parser.parse_args()
+
+    if args.benchmark:
+        run_benchmark(
+            n=args.n,
+            dataset_path=args.dataset,
+            checkpoint_path=args.checkpoint,
+            preprocessor_path=args.preprocessor,
+            top_k=args.top_k,
+        )
+        return
 
     device = get_device()
     model, checkpoint = load_checkpoint(args.checkpoint, device=device)
